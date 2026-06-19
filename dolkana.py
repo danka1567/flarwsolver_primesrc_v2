@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import functools
 import gzip
 import json
 import os
@@ -212,21 +213,37 @@ def _normalise_embed_url(raw: str, media_type: str = "movie") -> str:
 
 def _find_server_lists(obj: Any) -> list[dict[str, Any]]:
     lists: list[dict[str, Any]] = []
-    if isinstance(obj, dict):
-        servers = obj.get("servers")
-        if isinstance(servers, list) and servers:
-            if any(
-                "key" in item or "file_name" in item
-                for item in servers
-                if isinstance(item, dict)
-            ):
-                info = obj.get("info") if isinstance(obj.get("info"), dict) else {}
-                lists.append({"servers": servers, "info": info})
-        for v in obj.values():
-            lists.extend(_find_server_lists(v))
-    elif isinstance(obj, list):
-        for item in obj:
-            lists.extend(_find_server_lists(item))
+    seen_server_lists: set[str] = set()  # Track unique server lists by their keys
+
+    def _recursive_find(o: Any) -> None:
+        if isinstance(o, dict):
+            servers = o.get("servers")
+            if isinstance(servers, list) and servers:
+                if any(
+                    "key" in item or "file_name" in item
+                    for item in servers
+                    if isinstance(item, dict)
+                ):
+                    # Create a signature for this server list to detect duplicates
+                    # Use the first few keys to identify unique lists
+                    keys_signature = tuple(sorted(
+                        str(item.get("key", ""))
+                        for item in servers[:5]  # Check first 5 items
+                        if isinstance(item, dict) and item.get("key")
+                    ))
+
+                    if keys_signature and keys_signature not in seen_server_lists:
+                        seen_server_lists.add(keys_signature)
+                        info = o.get("info") if isinstance(o.get("info"), dict) else {}
+                        lists.append({"servers": servers, "info": info})
+
+            for v in o.values():
+                _recursive_find(v)
+        elif isinstance(o, list):
+            for item in o:
+                _recursive_find(item)
+
+    _recursive_find(obj)
     return lists
 
 
@@ -295,13 +312,12 @@ def stage1_fetch_api_keys(
             errors.append((embed_url, str(exc)))
             log_err(f"{label} {exc}  {embed_url}")
 
-    # Deduplicate by key value — same key from different embed URLs must
-    # only be processed once (they resolve to the exact same stream URL).
-    seen_keys: set[str] = set()
+    # Deduplicate by api_url
+    seen_api: set[str] = set()
     unique_options: list[ServerOption] = []
     for opt in all_options:
-        if opt.key not in seen_keys:
-            seen_keys.add(opt.key)
+        if opt.api_url not in seen_api:
+            seen_api.add(opt.api_url)
             unique_options.append(opt)
 
     api_list_file.write_text(
@@ -413,13 +429,15 @@ def _fs_post(base_url: str, payload: dict[str, Any], http_timeout: int = 120) ->
 
 async def _fs_create_session(base_url: str, session_id: str) -> None:
     loop = asyncio.get_running_loop()
-    resp = await loop.run_in_executor(
-        None,
-        lambda: _fs_post(base_url, {
+    fs_post_call = functools.partial(
+        _fs_post,
+        base_url,
+        {
             "cmd": "sessions.create",
             "session": session_id,
-        }),
+        }
     )
+    resp = await loop.run_in_executor(None, fs_post_call)
     if resp.get("status") not in ("ok", "warning"):
         log_warn(f"FlareSolverr session.create status: {resp.get('status')} — {resp.get('message')}")
     else:
@@ -429,13 +447,15 @@ async def _fs_create_session(base_url: str, session_id: str) -> None:
 async def _fs_destroy_session(base_url: str, session_id: str) -> None:
     loop = asyncio.get_running_loop()
     try:
-        await loop.run_in_executor(
-            None,
-            lambda: _fs_post(base_url, {
+        fs_post_call = functools.partial(
+            _fs_post,
+            base_url,
+            {
                 "cmd": "sessions.destroy",
                 "session": session_id,
-            }),
+            }
         )
+        await loop.run_in_executor(None, fs_post_call)
         log_info(f"FlareSolverr session destroyed: {session_id}")
     except Exception:
         pass
@@ -472,20 +492,12 @@ async def _resolve_one_flaresolverr(
 ) -> dict[str, Any]:
     loop  = asyncio.get_running_loop()
     label = f"[{index:>3}/{total}]"
-    # Each key gets its own isolated browser session so concurrent requests
-    # never share a tab and never return each other's cached response.
-    key_session_id = f"{session_id}_{index}"
 
     async with sem:
         await safe_print(f"{label} → {api_url}")
-        # Create a dedicated session for this key
-        await loop.run_in_executor(None, lambda: _fs_post(base_url, {
-            "cmd": "sessions.create", "session": key_session_id
-        }))
         last_error: str | None = None
 
-        try:
-          for attempt in range(reloads + 1):
+        for attempt in range(reloads + 1):
             if attempt:
                 # Exponential backoff (1.5s, 3s, 6s, 12s …), with a longer
                 # forced cool-down whenever Cloudflare is actively blocking
@@ -499,15 +511,18 @@ async def _resolve_one_flaresolverr(
 
             # ── Route Everything Directly Through FlareSolverr ──────────────────────
             try:
-                fs_resp = await loop.run_in_executor(
-                    None,
-                    lambda: _fs_post(base_url, {
+                # Create a proper partial function to avoid closure issues with concurrent execution
+                fs_post_call = functools.partial(
+                    _fs_post,
+                    base_url,
+                    {
                         "cmd":        "request.get",
                         "url":        api_url,
                         "maxTimeout": timeout_ms,
-                        "session":    key_session_id,
-                    }),
+                        "session":    session_id,
+                    }
                 )
+                fs_resp = await loop.run_in_executor(None, fs_post_call)
 
                 if fs_resp.get("status") != "ok":
                     last_error = (
@@ -553,20 +568,12 @@ async def _resolve_one_flaresolverr(
                 await safe_print(f"{label} ✗ (FS) {last_error}")
                 _record_log_entry("ERR", f"{label} {api_url} — {last_error}")
 
-          return {
+        return {
             "index":         index,
             "api_url":       api_url,
             "error":         last_error or "failed",
             "extracted_url": None,
-          }
-        finally:
-            # Always destroy the per-key session to free browser resources
-            try:
-                await loop.run_in_executor(None, lambda: _fs_post(base_url, {
-                    "cmd": "sessions.destroy", "session": key_session_id
-                }))
-            except Exception:
-                pass
+        }
 
 
 async def _process_batch_fs(
@@ -705,19 +712,13 @@ async def stage2_extract_stream_urls(
     fails   = [r for r in results if not r.get("extracted_url")]
 
     log_head(f"STAGE 2 RESULTS  ({elapsed:.1f}s total)")
-    seen_log: set[str] = set()
     for item in results:
-        url = item.get("extracted_url")
-        if url:
-            if url not in seen_log:
-                seen_log.add(url)
-                log_ok(f"{url}  (key: {item['api_url'].split('key=')[-1]})")
-            else:
-                log_ok(f"{url}  (key: {item['api_url'].split('key=')[-1]})  [same URL, different key]")
+        if item.get("extracted_url"):
+            log_ok(item["extracted_url"])
         else:
             log_err(f"FAILED : {item['api_url']}  ({item.get('error', 'no URL')})")
 
-    log_info(f"Success : {len(ok)} / {len(results)}    Unique URLs : {len(seen_log)}    Failed : {len(fails)}")
+    log_info(f"Success : {len(ok)} / {len(results)}    Failed : {len(fails)}")
     return results
 
 
