@@ -68,7 +68,7 @@ DEFAULT_HTML_OUT     = HERE / "pipeline_report.html"
 DEFAULT_ERROR_LOG    = HERE / "errorsfaced.txt"
 
 STAGE1_REQUEST_TIMEOUT = 20   # urllib timeout per /api/v1/s call
-STAGE2_BATCH_SIZE      = 2    # concurrent FlareSolverr requests (lowered to ease Cloudflare pressure)
+STAGE2_BATCH_SIZE      = 2    # concurrent requests — each key gets its own isolated FlareSolverr session
 STAGE2_RELOADS         = 3    # retry attempts per failed URL
 STAGE2_FINAL_RETRIES   = 2    # extra full retry passes for still-failed keys
 STAGE2_BATCH_DELAY     = 2.0  # seconds to wait between batches (cool-down for Cloudflare)
@@ -295,12 +295,13 @@ def stage1_fetch_api_keys(
             errors.append((embed_url, str(exc)))
             log_err(f"{label} {exc}  {embed_url}")
 
-    # Deduplicate by api_url
-    seen_api: set[str] = set()
+    # Deduplicate by key value — same key from different embed URLs must
+    # only be processed once (they resolve to the exact same stream URL).
+    seen_keys: set[str] = set()
     unique_options: list[ServerOption] = []
     for opt in all_options:
-        if opt.api_url not in seen_api:
-            seen_api.add(opt.api_url)
+        if opt.key not in seen_keys:
+            seen_keys.add(opt.key)
             unique_options.append(opt)
 
     api_list_file.write_text(
@@ -471,12 +472,20 @@ async def _resolve_one_flaresolverr(
 ) -> dict[str, Any]:
     loop  = asyncio.get_running_loop()
     label = f"[{index:>3}/{total}]"
+    # Each key gets its own isolated browser session so concurrent requests
+    # never share a tab and never return each other's cached response.
+    key_session_id = f"{session_id}_{index}"
 
     async with sem:
         await safe_print(f"{label} → {api_url}")
+        # Create a dedicated session for this key
+        await loop.run_in_executor(None, lambda: _fs_post(base_url, {
+            "cmd": "sessions.create", "session": key_session_id
+        }))
         last_error: str | None = None
 
-        for attempt in range(reloads + 1):
+        try:
+          for attempt in range(reloads + 1):
             if attempt:
                 # Exponential backoff (1.5s, 3s, 6s, 12s …), with a longer
                 # forced cool-down whenever Cloudflare is actively blocking
@@ -496,7 +505,7 @@ async def _resolve_one_flaresolverr(
                         "cmd":        "request.get",
                         "url":        api_url,
                         "maxTimeout": timeout_ms,
-                        "session":    session_id,
+                        "session":    key_session_id,
                     }),
                 )
 
@@ -544,12 +553,20 @@ async def _resolve_one_flaresolverr(
                 await safe_print(f"{label} ✗ (FS) {last_error}")
                 _record_log_entry("ERR", f"{label} {api_url} — {last_error}")
 
-        return {
+          return {
             "index":         index,
             "api_url":       api_url,
             "error":         last_error or "failed",
             "extracted_url": None,
-        }
+          }
+        finally:
+            # Always destroy the per-key session to free browser resources
+            try:
+                await loop.run_in_executor(None, lambda: _fs_post(base_url, {
+                    "cmd": "sessions.destroy", "session": key_session_id
+                }))
+            except Exception:
+                pass
 
 
 async def _process_batch_fs(
@@ -688,13 +705,19 @@ async def stage2_extract_stream_urls(
     fails   = [r for r in results if not r.get("extracted_url")]
 
     log_head(f"STAGE 2 RESULTS  ({elapsed:.1f}s total)")
+    seen_log: set[str] = set()
     for item in results:
-        if item.get("extracted_url"):
-            log_ok(item["extracted_url"])
+        url = item.get("extracted_url")
+        if url:
+            if url not in seen_log:
+                seen_log.add(url)
+                log_ok(f"{url}  (key: {item['api_url'].split('key=')[-1]})")
+            else:
+                log_ok(f"{url}  (key: {item['api_url'].split('key=')[-1]})  [same URL, different key]")
         else:
             log_err(f"FAILED : {item['api_url']}  ({item.get('error', 'no URL')})")
 
-    log_info(f"Success : {len(ok)} / {len(results)}    Failed : {len(fails)}")
+    log_info(f"Success : {len(ok)} / {len(results)}    Unique URLs : {len(seen_log)}    Failed : {len(fails)}")
     return results
 
 
@@ -808,6 +831,9 @@ def _write_summary(
 ) -> None:
     link_map = {r["api_url"]: r.get("extracted_url") or "" for r in stage2_results}
 
+    # Key by api_url (the unique key string) so every server option is kept
+    # as a separate source entry, even if two keys happen to resolve to the
+    # same stream URL at this moment (URLs rotate; they may differ next run).
     new_groups_raw: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
     for opt in stage1_options:
         stream_url = link_map.get(opt.api_url, "")
@@ -817,11 +843,9 @@ def _write_summary(
         tmdb = qs.get("tmdb", "")
         if not tmdb:
             continue
-        # Deduplicate within this run by URL — same stream URL must appear once per tmdb
-        if stream_url not in new_groups_raw[tmdb]:
-            new_groups_raw[tmdb][stream_url] = {"host": urlparse(stream_url).netloc, "url": stream_url}
+        new_groups_raw[tmdb][opt.api_url] = {"host": urlparse(stream_url).netloc, "url": stream_url, "key": opt.api_url}
     new_groups: dict[str, list[dict[str, Any]]] = {
-        tmdb: list(url_map.values()) for tmdb, url_map in new_groups_raw.items()
+        tmdb: list(entry_map.values()) for tmdb, entry_map in new_groups_raw.items()
     }
 
     existing: list[dict[str, Any]] = []
@@ -841,7 +865,8 @@ def _write_summary(
         sources: list[dict[str, str]] = []
         n = 1
         while f"host-{n}" in e:
-            sources.append({"host": e[f"host-{n}"], "url": e[f"url-{n}"]})
+            # Restore key field if stored, else use url as fallback identifier
+            sources.append({"host": e[f"host-{n}"], "url": e[f"url-{n}"], "key": e.get(f"key-{n}", e[f"url-{n}"])})
             n += 1
         index[tmdb_int] = {
             "tmdb_id":      tmdb_int,
@@ -859,8 +884,8 @@ def _write_summary(
 
         if tmdb_int in index:
             entry = index[tmdb_int]
-            existing_urls = {s["url"] for s in entry["_sources"]}
-            added = [s for s in new_sources if s["url"] not in existing_urls]
+            existing_keys = {s["key"] for s in entry["_sources"]}
+            added = [s for s in new_sources if s["key"] not in existing_keys]
             entry["_sources"].extend(added)
             entry["extracted_at"] = extracted_at
             log_info(f"  tmdb={tmdb_int} — merged {len(added)} new source(s)")
@@ -897,6 +922,7 @@ def _write_summary(
         for n, src in enumerate(e["_sources"], 1):
             row[f"host-{n}"] = src["host"]
             row[f"url-{n}"]  = src["url"]
+            row[f"key-{n}"]  = src.get("key", src["url"])  # persisted for dedup on re-runs
         output.append(row)
 
     json_path.write_text(_format_summary_json(output), encoding="utf-8")
@@ -1126,6 +1152,9 @@ def github_sync_summary(
     log_info(f"Remote total: {len(remote_records)} entries across {len(file_meta)} file(s)")
 
     link_map = {r["api_url"]: r.get("extracted_url") or "" for r in stage2_results}
+    # Key by api_url (the unique key string) so every server option is kept
+    # as a separate source entry, even if two keys happen to resolve to the
+    # same stream URL at this moment (URLs rotate; they may differ next run).
     new_groups_raw: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
     for opt in stage1_options:
         stream_url = link_map.get(opt.api_url, "")
@@ -1135,9 +1164,7 @@ def github_sync_summary(
         tmdb = qs.get("tmdb", "")
         if not tmdb:
             continue
-        # Deduplicate within this run by URL — same stream URL must appear once per tmdb
-        if stream_url not in new_groups_raw[tmdb]:
-            new_groups_raw[tmdb][stream_url] = {"host": urlparse(stream_url).netloc, "url": stream_url}
+        new_groups_raw[tmdb][opt.api_url] = {"host": urlparse(stream_url).netloc, "url": stream_url, "key": opt.api_url}
     new_groups: dict[str, list[dict[str, Any]]] = {
         tmdb: list(url_map.values()) for tmdb, url_map in new_groups_raw.items()
     }
@@ -1150,7 +1177,7 @@ def github_sync_summary(
         sources: list[dict[str, str]] = []
         n = 1
         while f"host-{n}" in e:
-            sources.append({"host": e[f"host-{n}"], "url": e[f"url-{n}"]})
+            sources.append({"host": e[f"host-{n}"], "url": e[f"url-{n}"], "key": e.get(f"key-{n}", e[f"url-{n}"])})
             n += 1
         index[tmdb_int] = {
             "tmdb_id":      tmdb_int,
@@ -1167,8 +1194,8 @@ def github_sync_summary(
         tmdb_int = int(tmdb_str)
         if tmdb_int in index:
             entry         = index[tmdb_int]
-            existing_urls = {s["url"] for s in entry["_sources"]}
-            added         = [s for s in new_sources if s["url"] not in existing_urls]
+            existing_keys = {s["key"] for s in entry["_sources"]}
+            added         = [s for s in new_sources if s["key"] not in existing_keys]
             entry["_sources"].extend(added)
             entry["extracted_at"] = extracted_at
             log_info(f"  tmdb={tmdb_int} — merged {len(added)} new source(s)")
@@ -1205,6 +1232,7 @@ def github_sync_summary(
         for n, src in enumerate(e["_sources"], 1):
             row[f"host-{n}"] = src["host"]
             row[f"url-{n}"]  = src["url"]
+            row[f"key-{n}"]  = src.get("key", src["url"])  # persisted for dedup on re-runs
         output.append(row)
 
     total_sources = sum(sum(1 for k in r if k.startswith("url-")) for r in output)
